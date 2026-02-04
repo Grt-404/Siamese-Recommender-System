@@ -3,16 +3,26 @@ import numpy as np
 import tensorflow as tf
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
+import os
 
+# ================= CONFIG =================
+TRAIN = True
+MODEL_PATH = "mentor_model.keras"
+# ========================================
+
+print("Starting...")
+
+# ================= LOAD =================
 
 train_df = pd.read_excel("train.xlsx")
 test_df  = pd.read_excel("test.xlsx")
 targets  = pd.read_csv("target.csv")
-print("Loaded data files.")
 
+print("Loaded files")
 
+# ================= PREPROCESS =================
 
-num_cols = ["Age", "Company_Size_Employees"]
+num_cols = ["Age","Company_Size_Employees"]
 cat_cols = ["Gender","Role","Seniority_Level","Industry","Location_City"]
 text_cols = ["Business_Interests","Business_Objectives","Constraints"]
 
@@ -27,153 +37,125 @@ ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
 train_cat = ohe.fit_transform(train_df[cat_cols].fillna("missing"))
 test_cat  = ohe.transform(test_df[cat_cols].fillna("missing"))
 
-train_text = train_df[text_cols].fillna("").agg(" ".join, axis=1).str.replace(";"," ")
-test_text  = test_df[text_cols].fillna("").agg(" ".join, axis=1).str.replace(";"," ")
+train_text = train_df[text_cols].fillna("").agg(" ".join,axis=1)
+test_text  = test_df[text_cols].fillna("").agg(" ".join,axis=1)
 
 tfidf = TfidfVectorizer(max_features=500)
 train_tfidf = tfidf.fit_transform(train_text).toarray()
 test_tfidf  = tfidf.transform(test_text).toarray()
 
-X_train_profiles = np.hstack([train_num, train_cat, train_tfidf])
-X_test_profiles  = np.hstack([test_num, test_cat, test_tfidf])
-print("Finished preprocessing profiles.")
+X_train = np.hstack([train_num,train_cat,train_tfidf])
+X_test  = np.hstack([test_num,test_cat,test_tfidf])
 
+print("Profiles built")
 
-id_to_index = {pid:i for i,pid in enumerate(train_df["Profile_ID"])}
+# ================= BUILD POSITIVE PAIRS =================
 
-XA, XB, y = [], [], []
+id_map = {pid:i for i,pid in enumerate(train_df["Profile_ID"])}
 
-for _,row in targets.iterrows():
-    i = id_to_index[row["src_user_id"]]
-    j = id_to_index[row["dst_user_id"]]
-    XA.append(X_train_profiles[i])
-    XB.append(X_train_profiles[j])
-    y.append(row["compatibility_score"])
+XA=[]
+XB=[]
+y=[]
+
+for _,r in targets.iterrows():
+    XA.append(X_train[id_map[r.src_user_id]])
+    XB.append(X_train[id_map[r.dst_user_id]])
+    y.append(r.compatibility_score)
 
 XA = np.array(XA)
 XB = np.array(XB)
 y  = np.array(y)
-print("Built labeled pairs.")
 
+# mirror
+XA0,XB0,y0 = XA.copy(),XB.copy(),y.copy()
+XA = np.concatenate([XA0,XB0])
+XB = np.concatenate([XB0,XA0])
+y  = np.concatenate([y0,y0])
 
-XA_orig = XA.copy()
-XB_orig = XB.copy()
-y_orig  = y.copy()
+# ================= NEGATIVE SAMPLING (FAST) =================
 
-XA = np.concatenate([XA_orig, XB_orig])
-XB = np.concatenate([XB_orig, XA_orig])
-y  = np.concatenate([y_orig,  y_orig])
+num_pos = len(y0)
+idx = np.random.choice(len(X_train),(num_pos,2),replace=True)
 
+neg_XA = X_train[idx[:,0]]
+neg_XB = X_train[idx[:,1]]
+neg_y  = np.zeros(num_pos)
 
-num_pos = len(y_orig)
-num_profiles = X_train_profiles.shape[0]
+XA = np.concatenate([XA,neg_XA])
+XB = np.concatenate([XB,neg_XB])
+y  = np.concatenate([y,neg_y])
 
-neg_XA, neg_XB, neg_y = [], [], []
-neg_pairs = set()
+# normalize + shuffle
+y = (y-y.min())/(y.max()-y.min()+1e-8)
 
-while len(neg_y) < num_pos:
-    i, j = np.random.choice(num_profiles, 2, replace=False)
-    neg_XA.append(X_train_profiles[i])
-    neg_XB.append(X_train_profiles[j])
-    neg_y.append(0.0)
+p = np.random.permutation(len(y))
+XA,XB,y = XA[p],XB[p],y[p]
 
-XA = np.concatenate([XA, np.array(neg_XA)])
-XB = np.concatenate([XB, np.array(neg_XB)])
-y  = np.concatenate([y,  np.array(neg_y)])
-print("Finished negative sampling and mirroring pairs.")
+print("Training samples:",len(y))
 
-# Normalize targets
-y = (y - y.min()) / (y.max() - y.min() + 1e-8)
+# ================= MODEL =================
 
-# Shuffle
-perm = np.random.permutation(len(XA))
-XA = XA[perm]
-XB = XB[perm]
-y  = y[perm]
+D = X_train.shape[1]
 
-print("y range:", y.min(), y.max())
-print("Ready to build model.")
-
-
-D = X_train_profiles.shape[1]
-
-user_NN = tf.keras.Sequential([
-    tf.keras.layers.Input(shape=(D,)),
-    tf.keras.layers.Dense(256, activation="relu"),
-    tf.keras.layers.Dropout(0.3),
-    tf.keras.layers.Dense(128, activation="relu"),
+userNN = tf.keras.Sequential([
+    tf.keras.layers.Dense(256,activation="relu",input_shape=(D,)),
+    tf.keras.layers.Dropout(0.2),
+    tf.keras.layers.Dense(128,activation="relu"),
     tf.keras.layers.Dense(64)
 ])
 
-second_NN = tf.keras.Sequential([
-    tf.keras.layers.Input(shape=(192,)),
-    tf.keras.layers.Dense(128, activation="relu"),
-    tf.keras.layers.Dropout(0.3),
-    tf.keras.layers.Dense(1, activation="sigmoid")
-])
+A = tf.keras.Input(shape=(D,))
+B = tf.keras.Input(shape=(D,))
 
-input_a = tf.keras.Input(shape=(D,))
-input_b = tf.keras.Input(shape=(D,))
+VA = tf.keras.layers.LayerNormalization()(userNN(A))
+VB = tf.keras.layers.LayerNormalization()(userNN(B))
 
-VA = user_NN(input_a)
-VB = user_NN(input_b)
+diff = tf.keras.layers.Subtract()([VA,VB])
+diff = tf.keras.layers.Lambda(lambda x: tf.abs(x))(diff)
 
-VA = tf.keras.layers.Lambda(lambda x: tf.math.l2_normalize(x, axis=1))(VA)
-VB = tf.keras.layers.Lambda(lambda x: tf.math.l2_normalize(x, axis=1))(VB)
+dot  = tf.keras.layers.Dot(axes=1)([VA,VB])
 
-diff = tf.keras.layers.Lambda(lambda x: tf.abs(x[0]-x[1]))([VA,VB])
-merged = tf.keras.layers.Concatenate(axis=1)([VA,VB,diff])
+merged = tf.keras.layers.Concatenate()([VA,VB,diff,dot])
 
-output = second_NN(merged)
+x = tf.keras.layers.Dense(128,activation="relu")(merged)
+x = tf.keras.layers.Dropout(0.2)(x)
+out = tf.keras.layers.Dense(1,activation="sigmoid")(x)
 
-model = tf.keras.Model([input_a,input_b], output)
+model = tf.keras.Model([A,B],out)
 
 model.compile(
     optimizer=tf.keras.optimizers.Adam(1e-4),
-    loss=tf.keras.losses.MeanSquaredError()
+    loss="binary_crossentropy"
 )
 
-model.summary()
+# ================= TRAIN / LOAD =================
 
+if TRAIN or not os.path.exists(MODEL_PATH):
+    print("Training...")
+    model.fit([XA,XB],y,batch_size=64,epochs=40,validation_split=0.2)
+    model.save(MODEL_PATH)
+    print("Model saved")
+else:
+    model = tf.keras.models.load_model(MODEL_PATH,safe_mode=False)
 
-cb = tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)
-print("Starting training...")
-model.fit(
-    [XA,XB],
-    y,
-    batch_size=64,
-    epochs=50,
-    validation_split=0.2,
-    callbacks=[cb]
-)
+# ================= FULL TEST CARTESIAN =================
 
+ids = test_df["Profile_ID"].values
+N=len(X_test)
 
-pair_ids = []
-test_XA = []
-test_XB = []
+print("Generating",N*N,"pairs")
 
-test_ids = test_df["Profile_ID"].values
+A_test = np.repeat(X_test,N,axis=0)
+B_test = np.tile(X_test,(N,1))
 
-N = min(200, len(X_test_profiles))
+pairs = np.repeat(ids,N).astype(str)+"_"+np.tile(ids,N).astype(str)
 
-for i in range(N):
-    for j in range(N):
-        if i != j:
-            test_XA.append(X_test_profiles[i])
-            test_XB.append(X_test_profiles[j])
-            pair_ids.append(str(test_ids[i]) + "_" + str(test_ids[j]))
+pred = model.predict([A_test,B_test],batch_size=512).flatten()
 
-test_XA = np.array(test_XA)
-test_XB = np.array(test_XB)
-
-preds = model.predict([test_XA,test_XB]).flatten()
-
-out = pd.DataFrame({
-    "pair": pair_ids,
-    "compatibility_score": preds
-})
-
-out.to_csv("submission.csv", index=False)
+pd.DataFrame({
+    "ID":pairs,
+    "compatibility_score":pred
+}).to_csv("submission.csv",index=False)
 
 print("Saved submission.csv")
-print("Prediction range:", preds.min(), preds.max())
+print("Prediction range:",pred.min(),pred.max())
